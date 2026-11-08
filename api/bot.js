@@ -1,18 +1,42 @@
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
+import admin from "firebase-admin";
 
+const TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
-  .map(id => id.trim())
+  .map(x => x.trim())
   .filter(Boolean);
 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const SETUP_KEY = process.env.SETUP_KEY;
-const PUBLIC_URL = process.env.PUBLIC_URL;
+const PUBLIC_URL = process.env.PUBLIC_URL?.replace(/\/+$/, "");
 
-const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const API = `https://api.telegram.org/bot${TOKEN}`;
 
-async function telegram(method, data = {}) {
+let db;
+
+function initFirebase() {
+  if (!admin.apps.length) {
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+    if (!privateKey) {
+      throw new Error("FIREBASE_PRIVATE_KEY is missing");
+    }
+
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: privateKey.replace(/\\n/g, "\n")
+      }),
+      databaseURL: process.env.FIREBASE_DATABASE_URL
+    });
+  }
+
+  db = admin.database();
+}
+
+async function tg(method, data = {}) {
   const response = await fetch(`${API}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -22,384 +46,641 @@ async function telegram(method, data = {}) {
   const result = await response.json();
 
   if (!result.ok) {
-    throw new Error(result.description || "Telegram API error");
+    throw new Error(result.description || `Telegram ${method} failed`);
   }
 
   return result.result;
 }
 
-function isAdmin(id) {
-  return ADMIN_IDS.includes(String(id));
+const isAdmin = id => ADMIN_IDS.includes(String(id));
+
+function escapeHTML(value = "") {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
 }
 
-function escapeText(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function getName(user) {
+function userName(user) {
   return [user.first_name, user.last_name]
     .filter(Boolean)
     .join(" ") || "Unknown";
 }
 
-function getMediaType(msg) {
-  if (msg.photo) return "PHOTO";
-  if (msg.video) return "VIDEO";
-  if (msg.document) return "DOCUMENT";
-  if (msg.audio) return "AUDIO";
-  if (msg.animation) return "GIF";
-  if (msg.voice) return "VOICE";
-  if (msg.video_note) return "VIDEO NOTE";
-  if (msg.sticker) return "STICKER";
-  return null;
-}
-
-function getUserId(caption) {
-  const match = String(caption || "").match(
-    /(?:user\s*id|uid)\s*[:\-]\s*([^\n]+)/i
-  );
-
-  return match ? match[1].trim() : "Not provided";
-}
-
-function createDetails(msg, requestId, mediaType) {
-  const user = msg.from;
-  const username = user.username
-    ? `@${user.username}`
-    : "Not available";
-
-  const userId = getUserId(msg.caption);
-
-  const originalCaption = msg.caption
-    ? `User Message: ${msg.caption}\n\n`
-    : "";
-
-  const details =
-    `━━━━━━━━━━━━━━━━\n` +
-    `📩 NEW SUBMISSION\n` +
-    `👤 Name: ${getName(user)}\n` +
-    `🔹 Username: ${username}\n` +
-    `🆔 Telegram ID: ${user.id}\n` +
-    `🪪 User ID: ${userId}\n` +
-    `📁 Media: ${mediaType}\n` +
-    `🔖 Request ID: ${requestId}\n` +
-    `🕒 Date: ${new Date().toLocaleString("en-GB", {
-      timeZone: "Asia/Karachi"
-    })}\n` +
-    `⏳ Status: PENDING\n` +
-    `━━━━━━━━━━━━━━━━`;
-
-  return (originalCaption + details).slice(0, 1024);
-}
-
-async function sendWelcome(chatId, user) {
-  if (isAdmin(user.id)) {
-    return telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `👑 Welcome Admin!\n\n` +
-        `Admin dashboard ke liye /panel bhejo.\n` +
-        `Your Telegram ID: ${user.id}`
-    });
-  }
-
-  return telegram("sendMessage", {
-    chat_id: chatId,
-    text:
-      `👋 Welcome to THG Submission Bot!\n\n` +
-      `Apni photo ya video bhejo.\n\n` +
-      `Caption mein apna User ID likhna:\n` +
-      `Example: User ID: 123456789\n\n` +
-      `Tumhari submission admin ko review ke liye mil jayegi.`
-  });
-}
-
-async function showPanel(chatId) {
-  return telegram("sendMessage", {
-    chat_id: chatId,
-    text:
-      `👑 THG ADMIN PANEL\n\n` +
-      `📩 User submissions admin ko yahin receive hongi.\n\n` +
-      `Reply system:\n` +
-      `1. User ki photo/video par Reply karo.\n` +
-      `2. Apna message likh kar send karo.\n` +
-      `3. Bot user ko tumhara reply bhej dega.\n\n` +
-      `Media Telegram mein hi rahegi.\n` +
-      `Kisi external database mein upload nahi hogi.`,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "🔄 Refresh Panel",
-            callback_data: "panel"
-          }
-        ],
-        [
-          {
-            text: "🆔 My Admin ID",
-            callback_data: "myid"
-          }
-        ]
+function mainKeyboard() {
+  return {
+    keyboard: [
+      [{ text: "📩 Report" }],
+      [
+        { text: "➕ Another Request" },
+        { text: "📋 My Requests" }
       ]
-    }
+    ],
+    resize_keyboard: true,
+    is_persistent: true
+  };
+}
+
+async function send(chatId, text, extra = {}) {
+  return tg("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    ...extra
   });
 }
 
-async function handleMedia(msg) {
-  const user = msg.from;
-  const chatId = msg.chat.id;
-  const mediaType = getMediaType(msg);
+async function updateUser(user) {
+  const id = String(user.id);
+  const ref = db.ref(`users/${id}`);
 
-  if (!mediaType) return;
+  await ref.transaction(current => {
+    current = current || {
+      telegramId: id,
+      totalRequests: 0,
+      firstSeen: Date.now()
+    };
 
-  const requestId = `THG-${Date.now()}`;
-  const details = createDetails(msg, requestId, mediaType);
+    current.name = userName(user);
+    current.username = user.username || "";
+    current.lastSeen = Date.now();
 
-  let delivered = 0;
-
-  for (const adminId of ADMIN_IDS) {
-    try {
-      const noCaption = Boolean(msg.video_note || msg.sticker);
-
-      // Copy the original Telegram media.
-      // It will NOT show a Forwarded label.
-      const copyData = {
-        chat_id: adminId,
-        from_chat_id: chatId,
-        message_id: msg.message_id
-      };
-
-      if (!noCaption) {
-        copyData.caption = details;
-      }
-
-      const copied = await telegram("copyMessage", copyData);
-
-      // For media without caption support, send details separately.
-      if (noCaption) {
-        await telegram("sendMessage", {
-          chat_id: adminId,
-          text: details,
-          reply_markup: {
-            force_reply: false
-          }
-        });
-      }
-
-      delivered++;
-
-    } catch (error) {
-      console.error(
-        "Admin delivery error:",
-        adminId,
-        error.message
-      );
-    }
-  }
-
-  if (delivered > 0) {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `✅ Your submission has been received!\n\n` +
-        `Request ID: ${requestId}\n` +
-        `Status: UNDER REVIEW`
-    });
-  } else {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `❌ Submission deliver nahi ho saki.\n` +
-        `Please thori dair baad dobara try karo.`
-    });
-  }
+    return current;
+  });
 }
 
-function getTargetTelegramId(replyMessage) {
-  const text =
-    replyMessage.caption ||
-    replyMessage.text ||
-    "";
+async function startReport(chatId) {
+  await db.ref(`sessions/${chatId}`).set({
+    mode: "awaiting_media",
+    updatedAt: Date.now()
+  });
 
-  const match = text.match(/Telegram ID:\s*(\d+)/i);
+  await send(
+    chatId,
+    "📩 <b>Submit Your Report</b>\n\nPlease send your report as a <b>photo or video</b>.\n\nAfter that, I will ask for your User ID.",
+    { reply_markup: mainKeyboard() }
+  );
+}
 
+function extractUserId(caption = "") {
+  const match = caption.match(/(?:user\s*id|uid)\s*[:：-]\s*([a-zA-Z0-9_-]+)/i);
   return match ? match[1] : null;
 }
 
-async function handleAdminReply(msg) {
-  if (!msg.reply_to_message) return false;
+async function submitReport(chatId, user, session, userId) {
+  const requestId = `RZ-${Date.now()}-${user.id}`;
+  const createdAt = Date.now();
 
-  const targetId = getTargetTelegramId(msg.reply_to_message);
+  const request = {
+    requestId,
+    userTelegramId: String(user.id),
+    chatId: String(chatId),
+    name: userName(user),
+    username: user.username || "",
+    userId,
+    mediaType: session.mediaType,
+    originalMessageId: session.messageId,
+    originalCaption: session.originalCaption || "",
+    createdAt,
+    status: "PENDING",
+    adminMessageIds: {}
+  };
 
-  if (!targetId) {
-    await telegram("sendMessage", {
-      chat_id: msg.chat.id,
-      text: "❌ User ki Telegram ID nahi mili. Original submission par Reply karo."
-    });
-    return true;
-  }
+  await db.ref(`requests/${requestId}`).set(request);
 
-  // Admin sends text through the bot.
-  if (msg.text) {
-    await telegram("sendMessage", {
-      chat_id: targetId,
-      text: `📩 Admin Reply:\n\n${msg.text}`
-    });
-  }
+  await db.ref(`users/${user.id}/totalRequests`).transaction(
+    value => (value || 0) + 1
+  );
 
-  // Admin can also reply with a photo, video or another media.
-  else {
-    await telegram("copyMessage", {
-      chat_id: targetId,
-      from_chat_id: msg.chat.id,
-      message_id: msg.message_id
-    });
-  }
+  await db.ref("stats/totalReports").transaction(
+    value => (value || 0) + 1
+  );
 
-  await telegram("sendMessage", {
-    chat_id: msg.chat.id,
-    text: "✅ Reply successfully sent to the user through THG Bot."
+  await db.ref("stats/pending").transaction(
+    value => (value || 0) + 1
+  );
+
+  const date = new Date(createdAt).toLocaleString("en-PK", {
+    timeZone: "Asia/Karachi",
+    dateStyle: "medium",
+    timeStyle: "short"
   });
+
+  const caption =
+    `⚠️ <b>NEW REPORT</b>\n\n` +
+    `🆔 Request: <code>${escapeHTML(requestId)}</code>\n` +
+    `👤 Name: ${escapeHTML(request.name)}\n` +
+    `🔗 Username: ${request.username ? "@" + escapeHTML(request.username) : "Not set"}\n` +
+    `🆔 Telegram ID: <code>${user.id}</code>\n` +
+    `🎮 User ID: <code>${escapeHTML(userId)}</code>\n` +
+    `📁 Type: ${escapeHTML(session.mediaType)}\n` +
+    `🕒 Time: ${escapeHTML(date)}\n` +
+    `📌 Status: <b>PENDING</b>`;
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: "✅ Mark Reviewed", callback_data: `rv|${requestId}` }
+      ],
+      [
+        { text: "👤 User History", callback_data: `uh|${user.id}` }
+      ]
+    ]
+  };
+
+  const adminMessageIds = {};
+
+  for (const adminId of ADMIN_IDS) {
+    try {
+      const copied = await tg("copyMessage", {
+        chat_id: adminId,
+        from_chat_id: chatId,
+        message_id: session.messageId,
+        caption,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup
+      });
+
+      adminMessageIds[adminId] = copied.message_id;
+
+      await db.ref(
+        `adminMessageMap/${adminId}/${copied.message_id}`
+      ).set({
+        userChatId: String(chatId),
+        requestId
+      });
+
+    } catch (error) {
+      console.error("Admin delivery failed:", adminId, error.message);
+    }
+  }
+
+  await db.ref(`requests/${requestId}/adminMessageIds`)
+    .set(adminMessageIds);
+
+  await db.ref(`sessions/${chatId}`).remove();
+
+  await send(
+    chatId,
+    "✅ <b>Your report has been submitted!</b>\n\n" +
+    `🆔 Request ID: <code>${escapeHTML(requestId)}</code>\n` +
+    "📌 Status: <b>UNDER REVIEW</b>\n\n" +
+    "You can check your report history using My Requests.",
+    { reply_markup: mainKeyboard() }
+  );
+}
+
+async function showMyRequests(chatId, userId) {
+  const snapshot = await db.ref("requests")
+    .orderByChild("userTelegramId")
+    .equalTo(String(userId))
+    .limitToLast(10)
+    .once("value");
+
+  if (!snapshot.exists()) {
+    return send(chatId, "📋 You have not submitted any reports yet.", {
+      reply_markup: mainKeyboard()
+    });
+  }
+
+  const reports = Object.values(snapshot.val())
+    .sort((a, b) => b.createdAt - a.createdAt);
+
+  let message = "📋 <b>YOUR RECENT REQUESTS</b>\n\n";
+
+  for (const report of reports) {
+    const date = new Date(report.createdAt).toLocaleString("en-PK", {
+      timeZone: "Asia/Karachi",
+      dateStyle: "medium",
+      timeStyle: "short"
+    });
+
+    message +=
+      `🆔 <code>${escapeHTML(report.requestId)}</code>\n` +
+      `🎮 User ID: <code>${escapeHTML(report.userId)}</code>\n` +
+      `📌 Status: <b>${escapeHTML(report.status)}</b>\n` +
+      `🕒 ${escapeHTML(date)}\n\n`;
+  }
+
+  await send(chatId, message, {
+    reply_markup: mainKeyboard()
+  });
+}
+
+async function showAdminPanel(chatId) {
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: "📊 Statistics", callback_data: "panel|stats" }
+      ],
+      [
+        { text: "📋 All Reports", callback_data: "panel|all" },
+        { text: "⏳ Pending", callback_data: "panel|pending" }
+      ],
+      [
+        { text: "👥 All Users", callback_data: "panel|users" }
+      ]
+    ]
+  };
+
+  await send(chatId, "⚙️ <b>REPORT ZONE ADMIN PANEL</b>\n\nSelect an option:", {
+    reply_markup: keyboard
+  });
+}
+
+async function showStats(chatId) {
+  const [users, reports, pending, reviewed] = await Promise.all([
+    db.ref("users").once("value"),
+    db.ref("stats/totalReports").once("value"),
+    db.ref("stats/pending").once("value"),
+    db.ref("stats/reviewed").once("value")
+  ]);
+
+  await send(
+    chatId,
+    "📊 <b>BOT STATISTICS</b>\n\n" +
+    `👥 Total Users: <b>${users.numChildren()}</b>\n` +
+    `📋 Total Reports: <b>${reports.val() || 0}</b>\n` +
+    `⏳ Pending: <b>${pending.val() || 0}</b>\n` +
+    `✅ Reviewed: <b>${reviewed.val() || 0}</b>`
+  );
+}
+
+async function showReportList(chatId, pendingOnly = false) {
+  let query = db.ref("requests")
+    .orderByChild("createdAt")
+    .limitToLast(15);
+
+  const snapshot = await query.once("value");
+
+  if (!snapshot.exists()) {
+    return send(chatId, "No reports found.");
+  }
+
+  const reports = Object.values(snapshot.val())
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .filter(r => !pendingOnly || r.status === "PENDING");
+
+  if (!reports.length) {
+    return send(chatId, "No pending reports found.");
+  }
+
+  for (const r of reports.slice(0, 10)) {
+    await send(
+      chatId,
+      `📋 <b>REPORT DETAILS</b>\n\n` +
+      `🆔 Request: <code>${escapeHTML(r.requestId)}</code>\n` +
+      `👤 ${escapeHTML(r.name)}\n` +
+      `🎮 User ID: <code>${escapeHTML(r.userId)}</code>\n` +
+      `🆔 Telegram ID: <code>${escapeHTML(r.userTelegramId)}</code>\n` +
+      `📌 Status: <b>${escapeHTML(r.status)}</b>`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "👤 User History",
+                callback_data: `uh|${r.userTelegramId}`
+              },
+              {
+                text: "✅ Review",
+                callback_data: `rv|${r.requestId}`
+              }
+            ]
+          ]
+        }
+      }
+    );
+  }
+}
+
+async function showUsers(chatId) {
+  const snapshot = await db.ref("users")
+    .orderByChild("lastSeen")
+    .limitToLast(15)
+    .once("value");
+
+  if (!snapshot.exists()) {
+    return send(chatId, "No users found.");
+  }
+
+  const users = Object.values(snapshot.val())
+    .sort((a, b) => b.lastSeen - a.lastSeen);
+
+  for (const user of users.slice(0, 10)) {
+    await send(
+      chatId,
+      `👤 <b>${escapeHTML(user.name)}</b>\n` +
+      `🆔 Telegram ID: <code>${escapeHTML(user.telegramId)}</code>\n` +
+      `🔗 Username: ${user.username ? "@" + escapeHTML(user.username) : "Not set"}\n` +
+      `📋 Total Requests: <b>${user.totalRequests || 0}</b>`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            {
+              text: "📋 Request History",
+              callback_data: `uh|${user.telegramId}`
+            }
+          ]]
+        }
+      }
+    );
+  }
+}
+
+async function showUserHistory(chatId, userId) {
+  const snapshot = await db.ref("requests")
+    .orderByChild("userTelegramId")
+    .equalTo(String(userId))
+    .limitToLast(10)
+    .once("value");
+
+  const user = await db.ref(`users/${userId}`).once("value");
+
+  let message = "👤 <b>USER HISTORY</b>\n\n";
+
+  if (user.exists()) {
+    const u = user.val();
+
+    message +=
+      `Name: ${escapeHTML(u.name)}\n` +
+      `Username: ${u.username ? "@" + escapeHTML(u.username) : "Not set"}\n` +
+      `Telegram ID: <code>${escapeHTML(userId)}</code>\n` +
+      `Total Requests: <b>${u.totalRequests || 0}</b>\n\n`;
+  }
+
+  if (snapshot.exists()) {
+    const reports = Object.values(snapshot.val())
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+    for (const r of reports) {
+      message +=
+        `🆔 <code>${escapeHTML(r.requestId)}</code>\n` +
+        `🎮 User ID: <code>${escapeHTML(r.userId)}</code>\n` +
+        `📌 ${escapeHTML(r.status)}\n\n`;
+    }
+  } else {
+    message += "No requests found.";
+  }
+
+  await send(chatId, message);
+}
+
+async function markReviewed(chatId, requestId) {
+  const ref = db.ref(`requests/${requestId}`);
+  const snapshot = await ref.once("value");
+
+  if (!snapshot.exists()) {
+    return send(chatId, "Request not found.");
+  }
+
+  const report = snapshot.val();
+
+  if (report.status !== "REVIEWED") {
+    await ref.update({
+      status: "REVIEWED",
+      reviewedAt: Date.now(),
+      reviewedBy: String(chatId)
+    });
+
+    await db.ref("stats/pending").transaction(
+      value => Math.max(0, (value || 0) - 1)
+    );
+
+    await db.ref("stats/reviewed").transaction(
+      value => (value || 0) + 1
+    );
+
+    await send(
+      report.chatId,
+      `✅ Your report <code>${escapeHTML(requestId)}</code> has been marked as <b>REVIEWED</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  await send(chatId, `✅ Request ${escapeHTML(requestId)} is now REVIEWED.`);
+}
+
+async function handleAdminReply(message) {
+  const adminId = String(message.from.id);
+  const repliedId = message.reply_to_message?.message_id;
+
+  if (!repliedId) return false;
+
+  const mapping = await db.ref(
+    `adminMessageMap/${adminId}/${repliedId}`
+  ).once("value");
+
+  if (!mapping.exists()) return false;
+
+  const data = mapping.val();
+
+  try {
+    await tg("copyMessage", {
+      chat_id: data.userChatId,
+      from_chat_id: message.chat.id,
+      message_id: message.message_id
+    });
+
+    await send(
+      message.chat.id,
+      `✅ Your reply was sent to the user.\nRequest: <code>${escapeHTML(data.requestId)}</code>`
+    );
+
+    await db.ref(`requests/${data.requestId}/lastAdminReplyAt`)
+      .set(Date.now());
+
+  } catch (error) {
+    await send(message.chat.id, `❌ Could not send reply: ${escapeHTML(error.message)}`);
+  }
 
   return true;
 }
 
-async function handleCallback(query) {
-  const userId = query.from.id;
-  const chatId = query.message.chat.id;
+async function handleCallback(callback) {
+  const adminId = callback.from.id;
+  const chatId = callback.message.chat.id;
+  const data = callback.data || "";
 
-  await telegram("answerCallbackQuery", {
-    callback_query_id: query.id
+  await tg("answerCallbackQuery", {
+    callback_query_id: callback.id
   });
 
-  if (!isAdmin(userId)) {
-    return telegram("sendMessage", {
-      chat_id: chatId,
-      text: "⛔ Access Denied."
-    });
+  if (!isAdmin(adminId)) return;
+
+  const [action, value] = data.split("|");
+
+  if (action === "panel") {
+    if (value === "stats") return showStats(chatId);
+    if (value === "all") return showReportList(chatId, false);
+    if (value === "pending") return showReportList(chatId, true);
+    if (value === "users") return showUsers(chatId);
   }
 
-  if (query.data === "panel") {
-    return showPanel(chatId);
+  if (action === "rv") {
+    return markReviewed(chatId, value);
   }
 
-  if (query.data === "myid") {
-    return telegram("sendMessage", {
-      chat_id: chatId,
-      text: `Your Admin ID: ${userId}`
-    });
+  if (action === "uh") {
+    return showUserHistory(chatId, value);
   }
+}
+
+async function handleMessage(message) {
+  if (!message?.from || message.from.is_bot) return;
+
+  const chatId = message.chat.id;
+  const user = message.from;
+  const userId = String(user.id);
+  const text = (message.text || "").trim();
+
+  await updateUser(user);
+
+  if (isAdmin(userId)) {
+    if (text === "/panel") {
+      return showAdminPanel(chatId);
+    }
+
+    if (text === "/start") {
+      return send(chatId, "⚙️ Admin access enabled.\nUse /panel to open the admin panel.");
+    }
+
+    if (await handleAdminReply(message)) {
+      return;
+    }
+  }
+
+  if (text === "/start") {
+    return send(
+      chatId,
+      "👋 Welcome to <b>Report Zone ⚠️</b>\n\n" +
+      "Use the 📩 Report button to submit a photo or video report.\n\n" +
+      "You can also check your previous reports.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (text === "/panel") {
+    return send(chatId, "⛔ Admin access only.");
+  }
+
+  if (text === "📩 Report" || text === "➕ Another Request") {
+    return startReport(chatId);
+  }
+
+  if (text === "📋 My Requests") {
+    return showMyRequests(chatId, userId);
+  }
+
+  const sessionRef = db.ref(`sessions/${chatId}`);
+  const sessionSnapshot = await sessionRef.once("value");
+  const session = sessionSnapshot.val();
+
+  const photo = message.photo?.length
+    ? message.photo[message.photo.length - 1]
+    : null;
+
+  const video = message.video || null;
+
+  if (session?.mode === "awaiting_media") {
+    if (!photo && !video) {
+      return send(chatId, "⚠️ Please send a photo or video to continue.");
+    }
+
+    const mediaType = photo ? "PHOTO" : "VIDEO";
+
+    const pending = {
+      mode: "awaiting_user_id",
+      mediaType,
+      messageId: message.message_id,
+      originalCaption: message.caption || "",
+      updatedAt: Date.now()
+    };
+
+    await sessionRef.set(pending);
+
+    const captionUserId = extractUserId(message.caption || "");
+
+    if (captionUserId) {
+      return submitReport(chatId, user, pending, captionUserId);
+    }
+
+    return send(
+      chatId,
+      "🆔 <b>Please send your User ID too.</b>\n\nSend your game User ID as a text message.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (session?.mode === "awaiting_user_id") {
+    if (!text || text.length < 2 || text.length > 64 ||
+        !/^[a-zA-Z0-9_-]+$/.test(text)) {
+      return send(
+        chatId,
+        "⚠️ Invalid User ID.\nPlease send a valid ID using letters or numbers only."
+      );
+    }
+
+    return submitReport(chatId, user, session, text);
+  }
+
+  return send(
+    chatId,
+    "Please use the buttons below to continue.\n\nTap 📩 Report to submit a new report.",
+    { reply_markup: mainKeyboard() }
+  );
 }
 
 export default async function handler(req, res) {
   try {
-    if (!BOT_TOKEN || !WEBHOOK_SECRET) {
-      return res.status(500).send("Missing bot environment variables.");
+    if (!TOKEN) {
+      return res.status(500).send("BOT_TOKEN is missing.");
     }
 
-    // Webhook setup
-    if (req.method === "GET") {
-      if (req.query?.setup) {
-        if (req.query.setup !== SETUP_KEY) {
-          return res.status(403).send("Invalid setup key.");
-        }
+    initFirebase();
 
-        const result = await telegram("setWebhook", {
+    if (req.method === "GET") {
+      if (req.query?.setup === SETUP_KEY && SETUP_KEY && PUBLIC_URL && WEBHOOK_SECRET) {
+        const result = await tg("setWebhook", {
           url: `${PUBLIC_URL}/api/bot`,
           secret_token: WEBHOOK_SECRET,
           allowed_updates: ["message", "callback_query"]
         });
 
         return res.status(200).send(
-          result ? "Webhook setup: SUCCESS" : "Webhook setup failed."
+          result ? "Webhook setup: SUCCESS" : "Webhook setup failed"
         );
       }
 
-      return res.status(200).send("THG Telegram Bot is running.");
+      return res.status(200).send("Report Zone Telegram Bot is running.");
     }
 
     if (req.method !== "POST") {
       return res.status(405).send("Method not allowed.");
     }
 
-    // Verify Telegram webhook
     if (
-      req.headers["x-telegram-bot-api-secret-token"] !==
-      WEBHOOK_SECRET
+      WEBHOOK_SECRET &&
+      req.headers["x-telegram-bot-api-secret-token"] !== WEBHOOK_SECRET
     ) {
-      return res.status(403).send("Unauthorized.");
+      return res.status(401).send("Unauthorized");
     }
 
-    const update = req.body || {};
+    const update = req.body;
 
-    if (update.callback_query) {
+    if (update?.message) {
+      await handleMessage(update.message);
+    } else if (update?.callback_query) {
       await handleCallback(update.callback_query);
-      return res.status(200).send("OK");
-    }
-
-    const msg = update.message;
-
-    if (!msg || !msg.from) {
-      return res.status(200).send("OK");
-    }
-
-    const user = msg.from;
-    const chatId = msg.chat.id;
-    const text = msg.text || "";
-
-    // Start command
-    if (text.startsWith("/start")) {
-      await sendWelcome(chatId, user);
-      return res.status(200).send("OK");
-    }
-
-    // Admin commands
-    if (isAdmin(user.id)) {
-      if (text.startsWith("/panel")) {
-        await showPanel(chatId);
-        return res.status(200).send("OK");
-      }
-
-      if (text.startsWith("/myid")) {
-        await telegram("sendMessage", {
-          chat_id: chatId,
-          text: `Your Telegram ID: ${user.id}`
-        });
-
-        return res.status(200).send("OK");
-      }
-
-      // Admin replies to a user's copied submission.
-      if (msg.reply_to_message) {
-        await handleAdminReply(msg);
-      }
-
-      return res.status(200).send("OK");
-    }
-
-    // User media submission
-    if (getMediaType(msg)) {
-      await handleMedia(msg);
-      return res.status(200).send("OK");
-    }
-
-    if (text) {
-      await telegram("sendMessage", {
-        chat_id: chatId,
-        text:
-          `📸 Please send a photo or video.\n\n` +
-          `Caption mein apna User ID bhi likhna.`
-      });
     }
 
     return res.status(200).send("OK");
 
   } catch (error) {
-    console.error("THG BOT ERROR:", error);
-
-    return res.status(200).send("OK");
+    console.error("Bot error:", error);
+    return res.status(200).send("Handled");
   }
 }
