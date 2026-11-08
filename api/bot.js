@@ -2,7 +2,7 @@
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
-  .map(x => x.trim())
+  .map(id => id.trim())
   .filter(Boolean);
 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
@@ -31,7 +31,7 @@ function isAdmin(id) {
   return ADMIN_IDS.includes(String(id));
 }
 
-async function sendText(chatId, text, extra = {}) {
+async function sendMessage(chatId, text, extra = {}) {
   return telegram("sendMessage", {
     chat_id: chatId,
     text,
@@ -39,19 +39,227 @@ async function sendText(chatId, text, extra = {}) {
   });
 }
 
-function getChatIdFromCaption(caption) {
-  const match = String(caption || "").match(/Chat ID:\s*(-?\d+)/i);
+function getTargetChatId(caption) {
+  const match = String(caption || "").match(
+    /THG_CHAT_ID:\s*(-?\d+)/i
+  );
   return match ? match[1] : null;
+}
+
+function getUserName(from) {
+  return [
+    from.first_name || "",
+    from.last_name || ""
+  ].join(" ").trim() || "Unknown";
+}
+
+async function handleMessage(msg) {
+  if (!msg || !msg.chat || !msg.from) return;
+
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const text = (msg.text || "").trim();
+  const admin = isAdmin(userId);
+
+  // ADMIN COMMANDS
+  if (admin && text === "/start") {
+    await sendMessage(
+      chatId,
+      "🛡️ THG ADMIN PANEL\n\n" +
+      "You are an authorized administrator.\n\n" +
+      "📩 New user submissions will arrive here.\n" +
+      "↩️ Reply directly to a submitted video to send a message to its user.\n\n" +
+      "Use /myid to check your own admin ID."
+    );
+    return;
+  }
+
+  // Only admins can use /myid
+  if (text === "/myid") {
+    if (admin) {
+      await sendMessage(
+        chatId,
+        `🛡️ Admin ID: ${userId}`
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        "This command is available to administrators only."
+      );
+    }
+    return;
+  }
+
+  // ADMIN REPLY TO USER SUBMISSION
+  if (admin && msg.reply_to_message) {
+    const originalCaption = msg.reply_to_message.caption || "";
+    const targetChatId = getTargetChatId(originalCaption);
+
+    if (!targetChatId) {
+      await sendMessage(
+        chatId,
+        "⚠️ User information not found.\nPlease reply directly to the original submitted video."
+      );
+      return;
+    }
+
+    if (!text || text.startsWith("/")) {
+      await sendMessage(
+        chatId,
+        "Please reply with a normal text message."
+      );
+      return;
+    }
+
+    await sendMessage(
+      targetChatId,
+      "📩 RESPONSE FROM THG ADMIN\n\n" + text
+    );
+
+    await sendMessage(
+      chatId,
+      "✅ Your response has been delivered to the user."
+    );
+    return;
+  }
+
+  // Do not expose admin information to users
+  if (admin) {
+    if (text === "/cancel") {
+      await sendMessage(chatId, "Action cancelled.");
+    } else {
+      await sendMessage(
+        chatId,
+        "📩 To respond to a user, reply directly to their submitted video."
+      );
+    }
+    return;
+  }
+
+  // USER START
+  if (text === "/start") {
+    await sendMessage(
+      chatId,
+      "Assalamualaikum! 👋\n\n" +
+      "Welcome to THG Submission Bot! 🎬\n\n" +
+      "You can submit your video for review.\n\n" +
+      "📌 Please include your Game ID in the video caption.\n\n" +
+      "Press the button below to submit your request, or send your video with its Game ID directly.",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🎬 Submit Your Request",
+                callback_data: "submit_request"
+              }
+            ]
+          ]
+        }
+      }
+    );
+    return;
+  }
+
+  if (text === "/cancel") {
+    await sendMessage(chatId, "Your current action has been cancelled.");
+    return;
+  }
+
+  // USER VIDEO SUBMISSION
+  if (msg.video) {
+    const userCaption = (msg.caption || "").trim();
+
+    if (!userCaption) {
+      await sendMessage(
+        chatId,
+        "❌ Your video does not have a caption.\n\n" +
+        "Please send the video again and write your Game ID in its caption.\n\n" +
+        "Example:\nGame ID: 123456789"
+      );
+      return;
+    }
+
+    const name = getUserName(msg.from);
+    const username = msg.from.username
+      ? "@" + msg.from.username
+      : "Not available";
+
+    // Keep the routing ID at the beginning of the admin caption
+    const adminCaption =
+      `THG_CHAT_ID: ${chatId}\n\n` +
+      `🎬 NEW VIDEO SUBMISSION\n\n` +
+      `👤 Name: ${name}\n` +
+      `🔗 Username: ${username}\n` +
+      `🆔 Telegram User ID: ${userId}\n` +
+      `💬 Chat ID: ${chatId}\n\n` +
+      `🎮 GAME ID / USER CAPTION:\n` +
+      userCaption;
+
+    let delivered = 0;
+
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await telegram("sendVideo", {
+          chat_id: adminId,
+          video: msg.video.file_id,
+          caption: adminCaption.slice(0, 1024)
+        });
+
+        delivered++;
+      } catch (error) {
+        console.error(
+          "Admin delivery failed:",
+          adminId,
+          error.message
+        );
+      }
+    }
+
+    if (delivered > 0) {
+      await sendMessage(
+        chatId,
+        "✅ Your request has been submitted successfully!\n\n" +
+        "⏳ Status: UNDER REVIEW\n\n" +
+        "Our admin team is checking your video. Please wait for a response."
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        "⚠️ Your video could not be submitted right now.\nPlease try again later."
+      );
+    }
+
+    return;
+  }
+
+  // USER BUTTON / PROMPT
+  if (text === "/submit" || text === "🎬 Submit Your Request") {
+    await sendMessage(
+      chatId,
+      "🎬 SEND YOUR VIDEO NOW\n\n" +
+      "Please attach your video and write your Game ID in the caption.\n\n" +
+      "Example:\nGame ID: 123456789\n\n" +
+      "Send both together in one message."
+    );
+    return;
+  }
+
+  // OTHER USER MESSAGES
+  await sendMessage(
+    chatId,
+    "Welcome to THG Submission Bot! 🎬\n\n" +
+    "Please send your video with your Game ID written in its caption."
+  );
 }
 
 module.exports = async (req, res) => {
   try {
-    // Basic configuration check
     if (!BOT_TOKEN || !ADMIN_IDS.length) {
       return res.status(500).send("Missing BOT_TOKEN or ADMIN_IDS");
     }
 
-    // One-time webhook setup
+    // WEBHOOK SETUP
     if (req.method === "GET" && req.query.setup) {
       if (!SETUP_KEY || req.query.setup !== SETUP_KEY) {
         return res.status(403).send("Invalid setup key");
@@ -63,18 +271,18 @@ module.exports = async (req, res) => {
 
       const webhookUrl = `${PUBLIC_URL}/api/bot`;
 
-      const result = await telegram("setWebhook", {
+      await telegram("setWebhook", {
         url: webhookUrl,
         secret_token: WEBHOOK_SECRET,
-        allowed_updates: ["message"]
+        allowed_updates: ["message", "callback_query"]
       });
 
       return res.status(200).send(
-        `Webhook setup: ${result ? "SUCCESS" : "FAILED"}\n${webhookUrl}`
+        `Webhook setup: SUCCESS\n${webhookUrl}`
       );
     }
 
-    // Health check
+    // HEALTH CHECK
     if (req.method === "GET") {
       return res.status(200).send("THG Telegram Bot is running.");
     }
@@ -83,7 +291,7 @@ module.exports = async (req, res) => {
       return res.status(405).send("Method not allowed");
     }
 
-    // Verify Telegram webhook secret
+    // VERIFY TELEGRAM SECRET
     const receivedSecret =
       req.headers["x-telegram-bot-api-secret-token"];
 
@@ -92,173 +300,47 @@ module.exports = async (req, res) => {
     }
 
     const update =
-      typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      typeof req.body === "string"
+        ? JSON.parse(req.body)
+        : req.body;
 
-    const msg = update && update.message;
-    if (!msg) return res.status(200).send("OK");
+    // INLINE BUTTON CLICK
+    if (update && update.callback_query) {
+      const callback = update.callback_query;
 
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = (msg.text || "").trim();
-    const admin = isAdmin(userId);
+      if (callback.data === "submit_request") {
+        await telegram("answerCallbackQuery", {
+          callback_query_id: callback.id,
+          text: "Ready! Send your video with your Game ID."
+        });
 
-    // Admin commands
-    if (admin && text === "/start") {
-      await sendText(
-        chatId,
-        "THG Admin Panel\n\n" +
-        "Send a reply to any submitted video to respond to that user.\n" +
-        "Use /myid to see your Telegram ID."
-      );
-      return res.status(200).send("OK");
-    }
-
-    if (text === "/myid") {
-      await sendText(
-        chatId,
-        `Your Telegram ID: ${userId}\nChat ID: ${chatId}`
-      );
-      return res.status(200).send("OK");
-    }
-
-    // Admin replies to a submitted video
-    if (admin && msg.reply_to_message) {
-      const originalCaption = msg.reply_to_message.caption || "";
-      const targetChatId = getChatIdFromCaption(originalCaption);
-
-      if (!targetChatId) {
-        await sendText(
-          chatId,
-          "I could not find the user's Chat ID. Reply directly to the original submitted video."
-        );
-        return res.status(200).send("OK");
-      }
-
-      if (!text) {
-        await sendText(
-          chatId,
-          "Please send a text reply to the submitted video."
-        );
-        return res.status(200).send("OK");
-      }
-
-      await sendText(
-        targetChatId,
-        `📩 Admin Response:\n\n${text}`
-      );
-
-      await sendText(chatId, "✅ Your reply was sent to the user.");
-      return res.status(200).send("OK");
-    }
-
-    // Ignore other admin messages
-    if (admin) {
-      await sendText(
-        chatId,
-        "Reply directly to a submitted video to message its user.\nUse /myid for your ID."
-      );
-      return res.status(200).send("OK");
-    }
-
-    // User commands
-    if (text === "/start") {
-      await sendText(
-        chatId,
-        "Assalamualaikum!\n\nWelcome to THG Video Submission Bot.\n\nPress the button below to submit your video.",
-        {
-          reply_markup: {
-            keyboard: [
-              [{ text: "🎬 Send Your ID and Video" }]
-            ],
-            resize_keyboard: true
-          }
-        }
-      );
-      return res.status(200).send("OK");
-    }
-
-    if (text === "/cancel") {
-      await sendText(chatId, "Submission cancelled.");
-      return res.status(200).send("OK");
-    }
-
-    if (text === "🎬 Send Your ID and Video") {
-      await sendText(
-        chatId,
-        "Please send your video with your Game ID written in the video caption.\n\nExample:\nGame ID: 123456789\n\nSend both together in one message."
-      );
-      return res.status(200).send("OK");
-    }
-
-    // Receive user video
-    if (msg.video) {
-      const userCaption = (msg.caption || "").trim();
-
-      if (!userCaption) {
-        await sendText(
-          chatId,
-          "❌ Your video has no caption.\nPlease resend the video with your Game ID in its caption."
-        );
-        return res.status(200).send("OK");
-      }
-
-      const name = [
-        msg.from.first_name || "",
-        msg.from.last_name || ""
-      ].join(" ").trim() || "Unknown";
-
-      const username = msg.from.username
-        ? `@${msg.from.username}`
-        : "Not available";
-
-      const adminCaption =
-        `🎬 NEW VIDEO SUBMISSION\n\n` +
-        `👤 User: ${name}\n` +
-        `🔗 Username: ${username}\n` +
-        `🆔 Telegram ID: ${userId}\n` +
-        `💬 Chat ID: ${chatId}\n\n` +
-        `🎮 User's ID / Caption:\n${userCaption.slice(0, 450)}`;
-
-      let delivered = 0;
-
-      for (const adminId of ADMIN_IDS) {
-        try {
-          await telegram("sendVideo", {
-            chat_id: adminId,
-            video: msg.video.file_id,
-            caption: adminCaption
-          });
-          delivered++;
-        } catch (error) {
-          console.error("Admin delivery failed:", adminId, error.message);
-        }
-      }
-
-      if (delivered > 0) {
-        await sendText(
-          chatId,
-          "✅ Your video has been received successfully.\n\n⏳ Status: Pending review."
-        );
-      } else {
-        await sendText(
-          chatId,
-          "⚠️ Your video could not be delivered to the admins. Please try again later."
+        await sendMessage(
+          callback.message.chat.id,
+          "🎬 SEND YOUR VIDEO NOW\n\n" +
+          "Attach your video and write your Game ID in the caption.\n\n" +
+          "Example:\nGame ID: 123456789"
         );
       }
 
       return res.status(200).send("OK");
     }
 
-    // Other user messages
-    await sendText(
-      chatId,
-      "Please press 🎬 Send Your ID and Video, then send your video with your Game ID in its caption."
-    );
+    // NORMAL MESSAGE
+    if (update && update.message) {
+      await handleMessage(update.message);
+    }
 
     return res.status(200).send("OK");
 
   } catch (error) {
     console.error("THG bot error:", error);
-    return res.status(200).send("Bot received the update.");
+
+    if (req.method === "GET") {
+      return res.status(500).send(
+        "Error: " + error.message
+      );
+    }
+
+    return res.status(200).send("OK");
   }
 };
