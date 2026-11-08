@@ -1,5 +1,6 @@
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+
 const ADMIN_IDS = (process.env.ADMIN_IDS || "")
   .split(",")
   .map(id => id.trim())
@@ -7,7 +8,7 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || "")
 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const SETUP_KEY = process.env.SETUP_KEY;
-const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+const PUBLIC_URL = process.env.PUBLIC_URL;
 
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
@@ -31,316 +32,374 @@ function isAdmin(id) {
   return ADMIN_IDS.includes(String(id));
 }
 
-async function sendMessage(chatId, text, extra = {}) {
+function escapeText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function getName(user) {
+  return [user.first_name, user.last_name]
+    .filter(Boolean)
+    .join(" ") || "Unknown";
+}
+
+function getMediaType(msg) {
+  if (msg.photo) return "PHOTO";
+  if (msg.video) return "VIDEO";
+  if (msg.document) return "DOCUMENT";
+  if (msg.audio) return "AUDIO";
+  if (msg.animation) return "GIF";
+  if (msg.voice) return "VOICE";
+  if (msg.video_note) return "VIDEO NOTE";
+  if (msg.sticker) return "STICKER";
+  return null;
+}
+
+function getUserId(caption) {
+  const match = String(caption || "").match(
+    /(?:user\s*id|uid)\s*[:\-]\s*([^\n]+)/i
+  );
+
+  return match ? match[1].trim() : "Not provided";
+}
+
+function createDetails(msg, requestId, mediaType) {
+  const user = msg.from;
+  const username = user.username
+    ? `@${user.username}`
+    : "Not available";
+
+  const userId = getUserId(msg.caption);
+
+  const originalCaption = msg.caption
+    ? `User Message: ${msg.caption}\n\n`
+    : "";
+
+  const details =
+    `━━━━━━━━━━━━━━━━\n` +
+    `📩 NEW SUBMISSION\n` +
+    `👤 Name: ${getName(user)}\n` +
+    `🔹 Username: ${username}\n` +
+    `🆔 Telegram ID: ${user.id}\n` +
+    `🪪 User ID: ${userId}\n` +
+    `📁 Media: ${mediaType}\n` +
+    `🔖 Request ID: ${requestId}\n` +
+    `🕒 Date: ${new Date().toLocaleString("en-GB", {
+      timeZone: "Asia/Karachi"
+    })}\n` +
+    `⏳ Status: PENDING\n` +
+    `━━━━━━━━━━━━━━━━`;
+
+  return (originalCaption + details).slice(0, 1024);
+}
+
+async function sendWelcome(chatId, user) {
+  if (isAdmin(user.id)) {
+    return telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `👑 Welcome Admin!\n\n` +
+        `Admin dashboard ke liye /panel bhejo.\n` +
+        `Your Telegram ID: ${user.id}`
+    });
+  }
+
   return telegram("sendMessage", {
     chat_id: chatId,
-    text,
-    ...extra
+    text:
+      `👋 Welcome to THG Submission Bot!\n\n` +
+      `Apni photo ya video bhejo.\n\n` +
+      `Caption mein apna User ID likhna:\n` +
+      `Example: User ID: 123456789\n\n` +
+      `Tumhari submission admin ko review ke liye mil jayegi.`
   });
 }
 
-function getTargetChatId(caption) {
-  const match = String(caption || "").match(
-    /THG_CHAT_ID:\s*(-?\d+)/i
-  );
+async function showPanel(chatId) {
+  return telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `👑 THG ADMIN PANEL\n\n` +
+      `📩 User submissions admin ko yahin receive hongi.\n\n` +
+      `Reply system:\n` +
+      `1. User ki photo/video par Reply karo.\n` +
+      `2. Apna message likh kar send karo.\n` +
+      `3. Bot user ko tumhara reply bhej dega.\n\n` +
+      `Media Telegram mein hi rahegi.\n` +
+      `Kisi external database mein upload nahi hogi.`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🔄 Refresh Panel",
+            callback_data: "panel"
+          }
+        ],
+        [
+          {
+            text: "🆔 My Admin ID",
+            callback_data: "myid"
+          }
+        ]
+      ]
+    }
+  });
+}
+
+async function handleMedia(msg) {
+  const user = msg.from;
+  const chatId = msg.chat.id;
+  const mediaType = getMediaType(msg);
+
+  if (!mediaType) return;
+
+  const requestId = `THG-${Date.now()}`;
+  const details = createDetails(msg, requestId, mediaType);
+
+  let delivered = 0;
+
+  for (const adminId of ADMIN_IDS) {
+    try {
+      const noCaption = Boolean(msg.video_note || msg.sticker);
+
+      // Copy the original Telegram media.
+      // It will NOT show a Forwarded label.
+      const copyData = {
+        chat_id: adminId,
+        from_chat_id: chatId,
+        message_id: msg.message_id
+      };
+
+      if (!noCaption) {
+        copyData.caption = details;
+      }
+
+      const copied = await telegram("copyMessage", copyData);
+
+      // For media without caption support, send details separately.
+      if (noCaption) {
+        await telegram("sendMessage", {
+          chat_id: adminId,
+          text: details,
+          reply_markup: {
+            force_reply: false
+          }
+        });
+      }
+
+      delivered++;
+
+    } catch (error) {
+      console.error(
+        "Admin delivery error:",
+        adminId,
+        error.message
+      );
+    }
+  }
+
+  if (delivered > 0) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ Your submission has been received!\n\n` +
+        `Request ID: ${requestId}\n` +
+        `Status: UNDER REVIEW`
+    });
+  } else {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Submission deliver nahi ho saki.\n` +
+        `Please thori dair baad dobara try karo.`
+    });
+  }
+}
+
+function getTargetTelegramId(replyMessage) {
+  const text =
+    replyMessage.caption ||
+    replyMessage.text ||
+    "";
+
+  const match = text.match(/Telegram ID:\s*(\d+)/i);
+
   return match ? match[1] : null;
 }
 
-function getUserName(from) {
-  return [
-    from.first_name || "",
-    from.last_name || ""
-  ].join(" ").trim() || "Unknown";
+async function handleAdminReply(msg) {
+  if (!msg.reply_to_message) return false;
+
+  const targetId = getTargetTelegramId(msg.reply_to_message);
+
+  if (!targetId) {
+    await telegram("sendMessage", {
+      chat_id: msg.chat.id,
+      text: "❌ User ki Telegram ID nahi mili. Original submission par Reply karo."
+    });
+    return true;
+  }
+
+  // Admin sends text through the bot.
+  if (msg.text) {
+    await telegram("sendMessage", {
+      chat_id: targetId,
+      text: `📩 Admin Reply:\n\n${msg.text}`
+    });
+  }
+
+  // Admin can also reply with a photo, video or another media.
+  else {
+    await telegram("copyMessage", {
+      chat_id: targetId,
+      from_chat_id: msg.chat.id,
+      message_id: msg.message_id
+    });
+  }
+
+  await telegram("sendMessage", {
+    chat_id: msg.chat.id,
+    text: "✅ Reply successfully sent to the user through THG Bot."
+  });
+
+  return true;
 }
 
-async function handleMessage(msg) {
-  if (!msg || !msg.chat || !msg.from) return;
+async function handleCallback(query) {
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
 
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const text = (msg.text || "").trim();
-  const admin = isAdmin(userId);
+  await telegram("answerCallbackQuery", {
+    callback_query_id: query.id
+  });
 
-  // ADMIN COMMANDS
-  if (admin && text === "/start") {
-    await sendMessage(
-      chatId,
-      "🛡️ THG ADMIN PANEL\n\n" +
-      "You are an authorized administrator.\n\n" +
-      "📩 New user submissions will arrive here.\n" +
-      "↩️ Reply directly to a submitted video to send a message to its user.\n\n" +
-      "Use /myid to check your own admin ID."
-    );
-    return;
+  if (!isAdmin(userId)) {
+    return telegram("sendMessage", {
+      chat_id: chatId,
+      text: "⛔ Access Denied."
+    });
   }
 
-  // Only admins can use /myid
-  if (text === "/myid") {
-    if (admin) {
-      await sendMessage(
-        chatId,
-        `🛡️ Admin ID: ${userId}`
-      );
-    } else {
-      await sendMessage(
-        chatId,
-        "This command is available to administrators only."
-      );
-    }
-    return;
+  if (query.data === "panel") {
+    return showPanel(chatId);
   }
 
-  // ADMIN REPLY TO USER SUBMISSION
-  if (admin && msg.reply_to_message) {
-    const originalCaption = msg.reply_to_message.caption || "";
-    const targetChatId = getTargetChatId(originalCaption);
-
-    if (!targetChatId) {
-      await sendMessage(
-        chatId,
-        "⚠️ User information not found.\nPlease reply directly to the original submitted video."
-      );
-      return;
-    }
-
-    if (!text || text.startsWith("/")) {
-      await sendMessage(
-        chatId,
-        "Please reply with a normal text message."
-      );
-      return;
-    }
-
-    await sendMessage(
-      targetChatId,
-      "📩 RESPONSE FROM THG ADMIN\n\n" + text
-    );
-
-    await sendMessage(
-      chatId,
-      "✅ Your response has been delivered to the user."
-    );
-    return;
+  if (query.data === "myid") {
+    return telegram("sendMessage", {
+      chat_id: chatId,
+      text: `Your Admin ID: ${userId}`
+    });
   }
+}
 
-  // Do not expose admin information to users
-  if (admin) {
-    if (text === "/cancel") {
-      await sendMessage(chatId, "Action cancelled.");
-    } else {
-      await sendMessage(
-        chatId,
-        "📩 To respond to a user, reply directly to their submitted video."
-      );
+export default async function handler(req, res) {
+  try {
+    if (!BOT_TOKEN || !WEBHOOK_SECRET) {
+      return res.status(500).send("Missing bot environment variables.");
     }
-    return;
-  }
 
-  // USER START
-  if (text === "/start") {
-    await sendMessage(
-      chatId,
-      "Assalamualaikum! 👋\n\n" +
-      "Welcome to THG Submission Bot! 🎬\n\n" +
-      "You can submit your video for review.\n\n" +
-      "📌 Please include your Game ID in the video caption.\n\n" +
-      "Press the button below to submit your request, or send your video with its Game ID directly.",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "🎬 Submit Your Request",
-                callback_data: "submit_request"
-              }
-            ]
-          ]
+    // Webhook setup
+    if (req.method === "GET") {
+      if (req.query?.setup) {
+        if (req.query.setup !== SETUP_KEY) {
+          return res.status(403).send("Invalid setup key.");
         }
-      }
-    );
-    return;
-  }
 
-  if (text === "/cancel") {
-    await sendMessage(chatId, "Your current action has been cancelled.");
-    return;
-  }
-
-  // USER VIDEO SUBMISSION
-  if (msg.video) {
-    const userCaption = (msg.caption || "").trim();
-
-    if (!userCaption) {
-      await sendMessage(
-        chatId,
-        "❌ Your video does not have a caption.\n\n" +
-        "Please send the video again and write your Game ID in its caption.\n\n" +
-        "Example:\nGame ID: 123456789"
-      );
-      return;
-    }
-
-    const name = getUserName(msg.from);
-    const username = msg.from.username
-      ? "@" + msg.from.username
-      : "Not available";
-
-    // Keep the routing ID at the beginning of the admin caption
-    const adminCaption =
-      `THG_CHAT_ID: ${chatId}\n\n` +
-      `🎬 NEW VIDEO SUBMISSION\n\n` +
-      `👤 Name: ${name}\n` +
-      `🔗 Username: ${username}\n` +
-      `🆔 Telegram User ID: ${userId}\n` +
-      `💬 Chat ID: ${chatId}\n\n` +
-      `🎮 GAME ID / USER CAPTION:\n` +
-      userCaption;
-
-    let delivered = 0;
-
-    for (const adminId of ADMIN_IDS) {
-      try {
-        await telegram("sendVideo", {
-          chat_id: adminId,
-          video: msg.video.file_id,
-          caption: adminCaption.slice(0, 1024)
+        const result = await telegram("setWebhook", {
+          url: `${PUBLIC_URL}/api/bot`,
+          secret_token: WEBHOOK_SECRET,
+          allowed_updates: ["message", "callback_query"]
         });
 
-        delivered++;
-      } catch (error) {
-        console.error(
-          "Admin delivery failed:",
-          adminId,
-          error.message
+        return res.status(200).send(
+          result ? "Webhook setup: SUCCESS" : "Webhook setup failed."
         );
       }
-    }
 
-    if (delivered > 0) {
-      await sendMessage(
-        chatId,
-        "✅ Your request has been submitted successfully!\n\n" +
-        "⏳ Status: UNDER REVIEW\n\n" +
-        "Our admin team is checking your video. Please wait for a response."
-      );
-    } else {
-      await sendMessage(
-        chatId,
-        "⚠️ Your video could not be submitted right now.\nPlease try again later."
-      );
-    }
-
-    return;
-  }
-
-  // USER BUTTON / PROMPT
-  if (text === "/submit" || text === "🎬 Submit Your Request") {
-    await sendMessage(
-      chatId,
-      "🎬 SEND YOUR VIDEO NOW\n\n" +
-      "Please attach your video and write your Game ID in the caption.\n\n" +
-      "Example:\nGame ID: 123456789\n\n" +
-      "Send both together in one message."
-    );
-    return;
-  }
-
-  // OTHER USER MESSAGES
-  await sendMessage(
-    chatId,
-    "Welcome to THG Submission Bot! 🎬\n\n" +
-    "Please send your video with your Game ID written in its caption."
-  );
-}
-
-module.exports = async (req, res) => {
-  try {
-    if (!BOT_TOKEN || !ADMIN_IDS.length) {
-      return res.status(500).send("Missing BOT_TOKEN or ADMIN_IDS");
-    }
-
-    // WEBHOOK SETUP
-    if (req.method === "GET" && req.query.setup) {
-      if (!SETUP_KEY || req.query.setup !== SETUP_KEY) {
-        return res.status(403).send("Invalid setup key");
-      }
-
-      if (!PUBLIC_URL || !WEBHOOK_SECRET) {
-        return res.status(500).send("Missing PUBLIC_URL or WEBHOOK_SECRET");
-      }
-
-      const webhookUrl = `${PUBLIC_URL}/api/bot`;
-
-      await telegram("setWebhook", {
-        url: webhookUrl,
-        secret_token: WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query"]
-      });
-
-      return res.status(200).send(
-        `Webhook setup: SUCCESS\n${webhookUrl}`
-      );
-    }
-
-    // HEALTH CHECK
-    if (req.method === "GET") {
       return res.status(200).send("THG Telegram Bot is running.");
     }
 
     if (req.method !== "POST") {
-      return res.status(405).send("Method not allowed");
+      return res.status(405).send("Method not allowed.");
     }
 
-    // VERIFY TELEGRAM SECRET
-    const receivedSecret =
-      req.headers["x-telegram-bot-api-secret-token"];
-
-    if (!WEBHOOK_SECRET || receivedSecret !== WEBHOOK_SECRET) {
-      return res.status(403).send("Forbidden");
+    // Verify Telegram webhook
+    if (
+      req.headers["x-telegram-bot-api-secret-token"] !==
+      WEBHOOK_SECRET
+    ) {
+      return res.status(403).send("Unauthorized.");
     }
 
-    const update =
-      typeof req.body === "string"
-        ? JSON.parse(req.body)
-        : req.body;
+    const update = req.body || {};
 
-    // INLINE BUTTON CLICK
-    if (update && update.callback_query) {
-      const callback = update.callback_query;
+    if (update.callback_query) {
+      await handleCallback(update.callback_query);
+      return res.status(200).send("OK");
+    }
 
-      if (callback.data === "submit_request") {
-        await telegram("answerCallbackQuery", {
-          callback_query_id: callback.id,
-          text: "Ready! Send your video with your Game ID."
+    const msg = update.message;
+
+    if (!msg || !msg.from) {
+      return res.status(200).send("OK");
+    }
+
+    const user = msg.from;
+    const chatId = msg.chat.id;
+    const text = msg.text || "";
+
+    // Start command
+    if (text.startsWith("/start")) {
+      await sendWelcome(chatId, user);
+      return res.status(200).send("OK");
+    }
+
+    // Admin commands
+    if (isAdmin(user.id)) {
+      if (text.startsWith("/panel")) {
+        await showPanel(chatId);
+        return res.status(200).send("OK");
+      }
+
+      if (text.startsWith("/myid")) {
+        await telegram("sendMessage", {
+          chat_id: chatId,
+          text: `Your Telegram ID: ${user.id}`
         });
 
-        await sendMessage(
-          callback.message.chat.id,
-          "🎬 SEND YOUR VIDEO NOW\n\n" +
-          "Attach your video and write your Game ID in the caption.\n\n" +
-          "Example:\nGame ID: 123456789"
-        );
+        return res.status(200).send("OK");
+      }
+
+      // Admin replies to a user's copied submission.
+      if (msg.reply_to_message) {
+        await handleAdminReply(msg);
       }
 
       return res.status(200).send("OK");
     }
 
-    // NORMAL MESSAGE
-    if (update && update.message) {
-      await handleMessage(update.message);
+    // User media submission
+    if (getMediaType(msg)) {
+      await handleMedia(msg);
+      return res.status(200).send("OK");
+    }
+
+    if (text) {
+      await telegram("sendMessage", {
+        chat_id: chatId,
+        text:
+          `📸 Please send a photo or video.\n\n` +
+          `Caption mein apna User ID bhi likhna.`
+      });
     }
 
     return res.status(200).send("OK");
 
   } catch (error) {
-    console.error("THG bot error:", error);
-
-    if (req.method === "GET") {
-      return res.status(500).send(
-        "Error: " + error.message
-      );
-    }
+    console.error("THG BOT ERROR:", error);
 
     return res.status(200).send("OK");
   }
-};
+}
