@@ -1,5 +1,10 @@
+
 {
-  "name": "thg-telegram-bot",
-  "version": "1.0.0",
-  "private": true
+  "name": "report-zone-bot",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "firebase-admin": "^13.5.0"
+  }
 }
